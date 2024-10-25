@@ -39,7 +39,11 @@ export default class TodoistProjectSync extends Plugin {
 
 async archiveRemovedProjects(files: TFile[], handledProjects: string[]) {
 	// Ensure the archive folder exists
-	const archiveFolderPath = `${this.settings.TodoistProjectFolder}/archive`;
+	const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth();
+    const quarter = Math.floor(month / 3) + 1; // 1 for Jan-Mar, 2 for Apr-Jun, etc.
+	const archiveFolderPath = `Archive/${year}/Q${quarter}/${TodoistProjectFolder}`;
 	if (!await this.app.vault.adapter.exists(archiveFolderPath)) {
 		await this.app.vault.createFolder(archiveFolderPath);
 	}
@@ -127,17 +131,60 @@ async createProjectFolder(project: Project, allProjects: Project[], baseFolder: 
 					// Create the note if it doesn't exist
 					await this.app.vault.create(
 						notePath,
-						`---\nTodoistId: ${project.id}\n---\n[${project.name}](https://todoist.com/app/project/${project.id})\n\`\`\`todoist\n"name": "${project.name}"\n"filter": "#${project.name}"\n\`\`\`\n`
+						`---\ntags: effort\nTodoistId: ${project.id}\nurl: https://todoist.com/app/project/${project.id} \n---\n\n> [!tasks]+ Tasks\n>\`\`\`todoist\n"name": ""\n"filter": "#${project.name}"\ngrouBy: section\n>\`\`\`\n\n- `
 					);
+					// Create Todoist task with a link to the new note
+					await createTodoistTaskForProject(project, notePath);
 				} else {
 					// If note already exists, rename or update it
 					const existingFile = filesById[project.id];
+					const existingNotePath = normalizePath(`${projectFolderPath}/${project.name}.md`);
+					
 					if (existingFile && existingFile.path !== notePath) {
 						await this.app.vault.rename(existingFile, notePath);
 					}
 				}
 			}
-	
+			
+			async function createTodoistTaskForProject(project, notePath) {
+				const obsidianNoteLink = `obsidian://open?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(notePath)}`;
+				
+				const taskData = {
+					content: `[Project note for ${project.name}](${obsidianNoteLink})`,
+					project_id: project.id,
+				};
+				
+				try {
+					const response = await fetch("https://api.todoist.com/rest/v1/tasks", {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							"Authorization": `Bearer ${todoistApiToken}`
+						},
+						body: JSON.stringify(taskData)
+					});
+					
+					if (!response.ok) {
+						throw new Error(`Failed to create Todoist task: ${response.statusText}`);
+					}
+					
+					console.log("Todoist task created successfully!");
+				} catch (error) {
+					console.error("Error creating Todoist task:", error);
+				}
+			}
+		
+		
+				else {
+					// If note already exists, rename or update it
+					const existingFile = filesById[project.id];
+					const existingNotePath = normalizePath(`${projectFolderPath}/${project.name}.md`); // Include "! " for renaming
+					if (existingFile && existingFile.path !== notePath) {
+						await this.app.vault.rename(existingFile, notePath);
+					}
+				}
+			}
+
 			// Archive any files not matching the current projects in Todoist
 			await this.archiveRemovedProjects(files, handledProjects);
 	
