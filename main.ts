@@ -35,7 +35,48 @@ export default class TodoistProjectSync extends Plugin {
 
 		this.setRefreshInterval();
 	}
+// Inside your TodoistProjectSync class
 
+async archiveRemovedProjects(files: TFile[], handledProjects: string[]) {
+	// Ensure the archive folder exists
+	const archiveFolderPath = `${this.settings.TodoistProjectFolder}/archive`;
+	if (!await this.app.vault.adapter.exists(archiveFolderPath)) {
+		await this.app.vault.createFolder(archiveFolderPath);
+	}
+
+	// Loop through each file to check if it’s still in Todoist projects
+	for (const file of files) {
+		const metadata = this.app.metadataCache.getFileCache(file);
+		if (metadata?.frontmatter?.TodoistId) {
+			const todoistId = metadata.frontmatter.TodoistId;
+
+			// If the project is no longer in the list of handled projects, archive it
+			if (!handledProjects.includes(todoistId)) {
+				await this.app.vault.rename(file, `${archiveFolderPath}/${todoistId}.md`);
+			}
+		}
+	}
+}
+async createProjectFolder(project: Project, allProjects: Project[], baseFolder: string): Promise<string> {
+	// Check if the project has a parent, and if so, create the folder inside the parent’s folder
+	let folderPath = baseFolder;
+
+	if (project.parentId) {
+		const parentProject = allProjects.find((p: Project) => p.id === project.parentId);
+		if (parentProject) {
+			// Recursively ensure the parent folder exists first
+			folderPath = await this.createProjectFolder(parentProject, allProjects, baseFolder);
+			folderPath = `${folderPath}/${project.name}`;
+		}
+	} else {
+		folderPath = `${baseFolder}/${project.name}`;
+	}
+
+	// Create the folder if it doesn't already exist
+	await this.app.vault.createFolder(folderPath).catch(() => {}); // Suppress errors if folder exists
+
+	return folderPath;
+}
 	setRefreshInterval() {
 		if (this.refreshIntervalID > 0)
 			window.clearInterval(this.refreshIntervalID);
@@ -49,95 +90,60 @@ export default class TodoistProjectSync extends Plugin {
 
 	}
 	async updateTodoistProjectFiles() {
-		if (!(os.hostname() === this.settings.PrimarySyncDevice || this.settings.PrimarySyncDevice === '')) 			///	Object.entries(app.commands.commands).filter(([, val]) => val.name.includes("Reload app without saving")).forEach(([id]) => console.log(id))
-		{
+		if (!(os.hostname() === this.settings.PrimarySyncDevice || this.settings.PrimarySyncDevice === '')) {
 			console.log("Not Primary sync device - skipping Todoist sync");
 			return;
 		}
-		//app:reload
+	
 		this.todoistApi = new TodoistApi(this.settings.TodoistToken);
-		if (!await this.app.vault.adapter.exists(this.settings.TodoistProjectFolder))
+	
+		// Ensure the Todoist Project Folder exists
+		if (!await this.app.vault.adapter.exists(this.settings.TodoistProjectFolder)) {
 			this.app.vault.createFolder(this.settings.TodoistProjectFolder);
+		}
+	
 		try {
 			const projects = await this.todoistApi.getProjects();
-
 			const files = this.app.vault.getMarkdownFiles();
-			const filesById: { [id: string]: TFile; } = {};
-
-			files.forEach(file => {
-				const Metadata = this.app.metadataCache.getFileCache(file);
-				if (Metadata?.frontmatter?.TodoistId)
-					filesById[Metadata?.frontmatter?.TodoistId] = file;
-
-			});
-			const handledProjects: string[] = [];
-			projects.forEach(async element => {
-				handledProjects.push(element.id);
-				let filepath = this.getPath(projects, element.id);
-				if (!await this.app.vault.adapter.exists(this.settings.TodoistProjectFolder + filepath))
-					await this.app.vault.createFolder(this.settings.TodoistProjectFolder + filepath);
-				//If a project has sub-projects, the note should be placed in the project folder, otherwise, it should be placed in the parent project folder.
-				if (projects.filter(p => p.parentId === element.id).length>0)
-					filepath = filepath +"/"+ element.name;
-				const filename = normalizePath(this.settings.TodoistProjectFolder + filepath + '/' + element.name + '.md');
-
-				if (!this.app.vault.getAbstractFileByPath(filename)) {
-					if (!filesById[element.id]) {
-						await this.app.vault.create(filename, "---\nTodoistId: " + element.id + "\n---\n[" + element.name + "](https://todoist.com/app/project/" + element.id + ")"
-							+ "\n```todoist \n\"name\": \"" + element.name + "\" \n\"filter\": \"#" + element.name + "\"\n```\n");
-					}
-					else {
-						const oldPath = "/" + filesById[element.id].path.substring(0, filesById[element.id].path.length - (element.name + ".md").length - 1);
-						if (!(await this.app.vault.adapter.exists("/" + filename)) && (await this.app.vault.adapter.exists("/" + filesById[element.id].path))) {
-
-							await this.app.vault.rename(filesById[element.id], filename);
-							if (this.app.vault.getAbstractFileByPath(normalizePath(oldPath)) instanceof TFolder) {
-								let folderToDelete = this.app.vault.getAbstractFileByPath(normalizePath(oldPath)) as TFolder;
-								let keepDeleting = true;
-								if (folderToDelete.children.length == 0) {
-									while (keepDeleting) {
-										const nextfolderToDelete = folderToDelete?.parent;
-										await this.app.fileManager.trashFile(folderToDelete!);
-										folderToDelete = nextfolderToDelete!;
-										if (folderToDelete.children.length > 0)
-											keepDeleting = false;
-
-									}
-
-								}
-							}
-						}
-					}
-				}
-			});
-			const filesToRemove: TFile[] = [];
-
+			const filesById = {};
+	
 			files.forEach(file => {
 				const Metadata = this.app.metadataCache.getFileCache(file);
 				if (Metadata?.frontmatter?.TodoistId) {
-					const todoistId: string = Metadata?.frontmatter?.TodoistId;
-					if (!handledProjects.contains(todoistId.toString())) {
-						filesToRemove.push(file);
+					filesById[Metadata.frontmatter.TodoistId] = file;
+				}
+			});
+	
+			const handledProjects = [];
+			for (const project of projects) {
+				handledProjects.push(project.id);
+	
+				// Create project folder path based on hierarchy
+				const projectFolderPath = await this.createProjectFolder(project, projects, this.settings.TodoistProjectFolder);
+	
+				// Define the path for the note inside its dedicated folder
+				const notePath = normalizePath(`${projectFolderPath}/${project.name}.md`);
+				if (!this.app.vault.getAbstractFileByPath(notePath)) {
+					// Create the note if it doesn't exist
+					await this.app.vault.create(
+						notePath,
+						`---\nTodoistId: ${project.id}\n---\n[${project.name}](https://todoist.com/app/project/${project.id})\n\`\`\`todoist\n"name": "${project.name}"\n"filter": "#${project.name}"\n\`\`\`\n`
+					);
+				} else {
+					// If note already exists, rename or update it
+					const existingFile = filesById[project.id];
+					if (existingFile && existingFile.path !== notePath) {
+						await this.app.vault.rename(existingFile, notePath);
 					}
 				}
-			})
-			filesToRemove.forEach(async file => {
-				if (!await this.app.vault.adapter.exists(this.settings.TodoistProjectFolder + "/archive"))
-					await this.app.vault.createFolder(this.settings.TodoistProjectFolder + "/archive");
-
-				const Metadata = this.app.metadataCache.getFileCache(file);
-				const projectNameFromMeta = Metadata?.frontmatter?.projectName;
-				const todooistId = Metadata?.frontmatter?.TodoistId;
-				if (!projectNameFromMeta)
-					this.app.fileManager.processFrontMatter(file, fm => fm["projectName"] = file.name)
-				// await this.addYamlProp("projectName", file.name, file);
-				await this.app.vault.rename(file, this.settings.TodoistProjectFolder + "/archive/" + todooistId + ".md");
-
-			});
+			}
+	
+			// Archive any files not matching the current projects in Todoist
+			await this.archiveRemovedProjects(files, handledProjects);
+	
+		} catch (error) {
+			console.error("Error syncing Todoist projects:", error);
 		}
-		catch (error) {
-			console.log(error)
-		};
 	}
 	getPath(projects: Project[], currentProjectId?: string): string {
 		let result = "";
