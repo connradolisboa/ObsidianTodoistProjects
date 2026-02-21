@@ -1,187 +1,295 @@
-import { App, Editor, FileManager, FileSystemAdapter, FrontMatterCache, MarkdownView, Modal, normalizePath, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder } from 'obsidian';
-import { Project, TodoistApi } from "@doist/todoist-api-typescript"// Remember to rename these classes and interfaces!
-import { Console, error } from 'console';
+import { App, normalizePath, Notice, Plugin, PluginSettingTab, requestUrl, Setting, TFile } from 'obsidian';
 import * as os from 'os';
+
+/** Minimal representation of a Todoist project, mapped from the API v1 response. */
+interface TodoistProject {
+	id: string;
+	name: string;
+	parentId: string | null;
+}
+
 interface TodoistProjectSyncSettings {
 	PrimarySyncDevice: string;
 	TodoistSyncFrequency: number;
 	TodoistToken: string;
 	TodoistProjectFolder: string;
+	/** Vault-root-relative path where notes for deleted Todoist projects are moved. */
+	ArchiveFolder: string;
+	/**
+	 * Template string for newly created project notes.
+	 * Supports the following variables:
+	 *   {{TodoistId}}    — the project's unique Todoist ID
+	 *   {{ProjectName}}  — the project's display name
+	 *   {{TodoistUrl}}   — full URL to open the project in Todoist
+	 */
+	NoteTemplate: string;
 }
 
 const DEFAULT_SETTINGS: TodoistProjectSyncSettings = {
 	TodoistToken: '',
 	TodoistProjectFolder: 'Projects',
 	TodoistSyncFrequency: 60,
-	PrimarySyncDevice: ''
+	PrimarySyncDevice: '',
+	ArchiveFolder: 'Projects/archive',
+	NoteTemplate: [
+		'---',
+		'tags: project',
+		'TodoistId: {{TodoistId}}',
+		'url: {{TodoistUrl}}',
+		'---',
+		' # {{ProjectName}}',
+		'[Open in Todoist]({{TodoistUrl}})',
+		'```todoist',
+		'"filter": "#{{ProjectName}}"',
+		'"groupBy": "section"',
+		'```',
+		''
+	].join('\n')
 }
 
 export default class TodoistProjectSync extends Plugin {
 	settings: TodoistProjectSyncSettings;
 	refreshIntervalID: number;
-	todoistApi: TodoistApi;
 
+	/** Plugin entry point — loads settings and starts the sync interval. */
 	async onload() {
 		await this.loadSettings();
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new TodoistSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		// this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-		// 	console.log('click', evt);
-		// });
-
 		this.setRefreshInterval();
+
+		this.addCommand({
+			id: 'sync-todoist-projects',
+			name: 'Sync Todoist projects now',
+			callback: async () => {
+				new Notice('Syncing Todoist projects…');
+				await this.updateTodoistProjectFiles();
+				new Notice('Todoist projects synced.');
+			}
+		});
 	}
-// Inside your TodoistProjectSync class
 
-async archiveRemovedProjects(files: TFile[], handledProjects: string[]) {
-	// Ensure the archive folder exists
-	const archiveFolderPath = `${this.settings.TodoistProjectFolder}/archive`;
-	if (!await this.app.vault.adapter.exists(archiveFolderPath)) {
-		await this.app.vault.createFolder(archiveFolderPath);
+	/**
+	 * Fetches all projects from the Todoist API v1 using Obsidian's
+	 * requestUrl (bypasses CORS restrictions in Electron).
+	 *
+	 * @param token  Todoist API token.
+	 * @returns      Array of TodoistProject objects.
+	 * @throws       If the request fails or the token is invalid (HTTP 4xx/5xx).
+	 */
+	async fetchTodoistProjects(token: string): Promise<TodoistProject[]> {
+		const projects: TodoistProject[] = [];
+		let cursor: string | null = null;
+
+		do {
+			const url = new URL('https://api.todoist.com/api/v1/projects');
+			if (cursor) url.searchParams.set('cursor', cursor);
+
+			const response = await requestUrl({
+				url: url.toString(),
+				headers: { 'Authorization': `Bearer ${token}` }
+			});
+			const body = response.json as { results: Array<{ id: string; name: string; parent_id: string | null }>; next_cursor: string | null };
+			projects.push(...body.results.map(p => ({ id: p.id, name: p.name, parentId: p.parent_id })));
+			cursor = body.next_cursor;
+		} while (cursor);
+
+		return projects;
 	}
 
-	// Loop through each file to check if it’s still in Todoist projects
-	for (const file of files) {
-		const metadata = this.app.metadataCache.getFileCache(file);
-		if (metadata?.frontmatter?.TodoistId) {
-			const todoistId = metadata.frontmatter.TodoistId;
+	/**
+	 * Archives project notes whose TodoistId is no longer in the active projects list.
+	 * Files already located inside the archive folder are skipped to prevent
+	 * attempting to re-archive an already-archived file.
+	 *
+	 * @param files            All markdown files currently in the vault.
+	 * @param handledProjects  Array of active Todoist project IDs.
+	 */
+	async archiveRemovedProjects(files: TFile[], handledProjects: string[]) {
+		const archiveFolderPath = normalizePath(this.settings.ArchiveFolder);
 
-			// If the project is no longer in the list of handled projects, archive it
-			if (!handledProjects.includes(todoistId)) {
-				await this.app.vault.rename(file, `${archiveFolderPath}/${todoistId}.md`);
+		if (!await this.app.vault.adapter.exists(archiveFolderPath)) {
+			await this.app.vault.createFolder(archiveFolderPath);
+		}
+
+		for (const file of files) {
+			// Skip files already in the archive to prevent re-archiving
+			if (file.path.startsWith(archiveFolderPath + '/')) {
+				continue;
+			}
+
+			const metadata = this.app.metadataCache.getFileCache(file);
+			if (metadata?.frontmatter?.TodoistId) {
+				const todoistId: string = metadata.frontmatter.TodoistId;
+				if (!handledProjects.includes(todoistId)) {
+					const archivePath = normalizePath(`${archiveFolderPath}/${todoistId}.md`);
+					await this.app.vault.rename(file, archivePath);
+				}
 			}
 		}
 	}
-}
-async createProjectFolder(project: Project, allProjects: Project[], baseFolder: string): Promise<string> {
-	// Check if the project has a parent, and if so, create the folder inside the parent’s folder
-	let folderPath = baseFolder;
 
-	if (project.parentId) {
-		const parentProject = allProjects.find((p: Project) => p.id === project.parentId);
-		if (parentProject) {
-			// Recursively ensure the parent folder exists first
-			folderPath = await this.createProjectFolder(parentProject, allProjects, baseFolder);
-			folderPath = `${folderPath}/${project.name}`;
+	/**
+	 * Recursively creates the vault folder hierarchy for a Todoist project.
+	 *
+	 * If the project has a parent, this method first ensures the parent's folder
+	 * exists (recursing up the tree), then creates a sub-folder named after this
+	 * project inside it. Top-level projects are created directly under baseFolder.
+	 *
+	 * Folder creation errors (e.g. folder already exists) are silently suppressed.
+	 *
+	 * @param project     The project whose folder is being created.
+	 * @param allProjects Full list of Todoist projects, used to resolve parent references.
+	 * @param baseFolder  The root vault folder for all project notes.
+	 * @returns           The vault path of the folder created for this project.
+	 */
+	async createProjectFolder(project: TodoistProject, allProjects: TodoistProject[], baseFolder: string): Promise<string> {
+		let folderPath = baseFolder;
+
+		if (project.parentId) {
+			const parentProject = allProjects.find(p => p.id === project.parentId);
+			if (parentProject) {
+				// Recursively ensure the parent folder exists first
+				folderPath = await this.createProjectFolder(parentProject, allProjects, baseFolder);
+				folderPath = `${folderPath}/${project.name}`;
+			}
+		} else {
+			folderPath = `${baseFolder}/${project.name}`;
 		}
-	} else {
-		folderPath = `${baseFolder}/${project.name}`;
+
+		// Create the folder if it doesn't already exist
+		await this.app.vault.createFolder(folderPath).catch(() => {}); // Suppress errors if folder exists
+
+		return folderPath;
 	}
 
-	// Create the folder if it doesn't already exist
-	await this.app.vault.createFolder(folderPath).catch(() => {}); // Suppress errors if folder exists
+	/**
+	 * Renders a note template, substituting {{Variable}} placeholders with
+	 * values from the given Todoist project.
+	 *
+	 * Available variables:
+	 *   {{TodoistId}}    — The project's unique Todoist ID (e.g. "2203306141")
+	 *   {{ProjectName}}  — The project's display name (e.g. "Work")
+	 *   {{TodoistUrl}}   — Full URL to open the project in Todoist
+	 *                      (e.g. "https://todoist.com/app/project/2203306141")
+	 *
+	 * @param template  Template string with {{Variable}} placeholders.
+	 * @param project   Todoist project providing substitution values.
+	 * @returns         Rendered string with all placeholders replaced.
+	 */
+	renderTemplate(template: string, project: TodoistProject): string {
+		const todoistUrl = `https://todoist.com/app/project/${project.id}`;
+		return template
+			.replaceAll('{{TodoistId}}', project.id)
+			.replaceAll('{{ProjectName}}', project.name)
+			.replaceAll('{{TodoistUrl}}', todoistUrl);
+	}
 
-	return folderPath;
-}
+	/**
+	 * Clears any existing sync interval and starts a new one based on the
+	 * current TodoistSyncFrequency setting.
+	 *
+	 * If frequency is 0 or less, no interval is registered (sync is disabled).
+	 * Call this method after changing TodoistSyncFrequency to apply the change
+	 * immediately without reloading the plugin.
+	 */
 	setRefreshInterval() {
 		if (this.refreshIntervalID > 0)
 			window.clearInterval(this.refreshIntervalID);
 		if (this.settings.TodoistSyncFrequency > 0)
-			this.refreshIntervalID= this.registerInterval(window.setInterval(async () => {
+			this.refreshIntervalID = this.registerInterval(window.setInterval(async () => {
 				console.log(new Date().toLocaleString() + ': Updating Todoist Project files');
 				await this.updateTodoistProjectFiles();
 				console.log(new Date().toLocaleString() + ': Todoist Project files updated');
-			}
-				, this.settings.TodoistSyncFrequency * 1000));
-
+			}, this.settings.TodoistSyncFrequency * 1000));
 	}
+
+	/**
+	 * Main sync handler. Fetches all projects from Todoist and reconciles them
+	 * with the vault:
+	 *
+	 *  - For each active project, a note is created at
+	 *    `{TodoistProjectFolder}/{hierarchy}/{ProjectName}.md`.
+	 *  - If a note with a matching `TodoistId` frontmatter field already exists
+	 *    elsewhere in the vault, it is renamed/moved to the correct path.
+	 *  - If the note was previously archived, it is restored from the archive
+	 *    folder to the correct path.
+	 *  - If no note exists at all, a new note is created using the configured
+	 *    NoteTemplate. Template variables available in the template:
+	 *      {{TodoistId}}   — the project's Todoist ID
+	 *      {{ProjectName}} — the project's display name
+	 *      {{TodoistUrl}}  — URL to open the project in Todoist
+	 *  - Projects no longer present in Todoist have their notes moved to the
+	 *    configured ArchiveFolder.
+	 */
 	async updateTodoistProjectFiles() {
 		if (!(os.hostname() === this.settings.PrimarySyncDevice || this.settings.PrimarySyncDevice === '')) {
 			console.log("Not Primary sync device - skipping Todoist sync");
 			return;
 		}
-	
-		this.todoistApi = new TodoistApi(this.settings.TodoistToken);
-	
-		// Ensure the Todoist Project Folder exists
+
+		// Ensure the base project folder exists
 		if (!await this.app.vault.adapter.exists(this.settings.TodoistProjectFolder)) {
 			this.app.vault.createFolder(this.settings.TodoistProjectFolder);
 		}
-	
+
 		try {
-			const projects = await this.todoistApi.getProjects();
+			const projects = await this.fetchTodoistProjects(this.settings.TodoistToken);
 			const files = this.app.vault.getMarkdownFiles();
-			const filesById = {};
-	
+
+			// Build a map from TodoistId -> TFile for O(1) lookup
+			const filesById: Record<string, TFile> = {};
 			files.forEach(file => {
-				const Metadata = this.app.metadataCache.getFileCache(file);
-				if (Metadata?.frontmatter?.TodoistId) {
-					filesById[Metadata.frontmatter.TodoistId] = file;
+				const metadata = this.app.metadataCache.getFileCache(file);
+				if (metadata?.frontmatter?.TodoistId) {
+					filesById[metadata.frontmatter.TodoistId] = file;
 				}
 			});
-	
-			const handledProjects = [];
+
+			const handledProjects: string[] = [];
 			for (const project of projects) {
 				handledProjects.push(project.id);
-	
-				// Create project folder path based on hierarchy
+
 				const projectFolderPath = await this.createProjectFolder(project, projects, this.settings.TodoistProjectFolder);
-	
-				// Define the path for the note inside its dedicated folder
 				const notePath = normalizePath(`${projectFolderPath}/${project.name}.md`);
-				if (!this.app.vault.getAbstractFileByPath(notePath)) {
-					// Create the note if it doesn't exist
-					await this.app.vault.create(
-						notePath,
-						`---\ntags: project\nTodoistId: ${project.id}\nurl: https://todoist.com/app/project/${project.id}\n---\n # ${project.name}\n[Open in Todoist](https://todoist.com/app/project/${project.id})\n\`\`\`todoist\n"filter": "#${project.name}"\n"groupBy": "section"\n\`\`\`\n`
-					);
-				} else {
-					// If note already exists, rename or update it
+
+				if (this.app.vault.getAbstractFileByPath(notePath)) {
+					// Note exists at the correct path — rename any stale duplicate if present
 					const existingFile = filesById[project.id];
 					if (existingFile && existingFile.path !== notePath) {
 						await this.app.vault.rename(existingFile, notePath);
 					}
+				} else {
+					// Note is not at the correct path — find or create it
+					const existingFile = filesById[project.id];
+					if (existingFile) {
+						// A file with this TodoistId exists somewhere else in the vault — move it
+						await this.app.vault.rename(existingFile, notePath);
+					} else {
+						// Check if the note was previously archived — restore it if so
+						const archivePath = normalizePath(`${this.settings.ArchiveFolder}/${project.id}.md`);
+						const archivedFile = this.app.vault.getAbstractFileByPath(archivePath);
+						if (archivedFile instanceof TFile) {
+							await this.app.vault.rename(archivedFile, notePath);
+						} else {
+							// No existing note anywhere — create a fresh one from the template
+							await this.app.vault.create(
+								notePath,
+								this.renderTemplate(this.settings.NoteTemplate, project)
+							);
+						}
+					}
 				}
 			}
-	
-			// Archive any files not matching the current projects in Todoist
+
+			// Archive notes for projects that no longer exist in Todoist
 			await this.archiveRemovedProjects(files, handledProjects);
-	
+
 		} catch (error) {
 			console.error("Error syncing Todoist projects:", error);
 		}
 	}
-	getPath(projects: Project[], currentProjectId?: string): string {
-		let result = "";
-		if (currentProjectId) {
-			const currentProject = projects.find(p => p.id === currentProjectId);
-			if (currentProject?.parentId) {
-				const parentProj = projects.find((proj: Project) => proj.id === currentProject?.parentId);
-				if (parentProj)
-					result = this.getPath(projects, parentProj.id) + "/" + parentProj.name;
-				else
-					throw new RangeError("Project tree structure in Todoist is malformed. Project with ID: " + currentProject.parentId + "Does not exist");
-			}
-		}
-		return result;
 
-	}
-	// public async addYamlProp(propName: string, propValue: string, file: TFile): Promise<void> {
-	// 	const fileContent: string = await this.app.vault.read(file);
-	// 	const isYamlEmpty: boolean = (this.app.metadataCache.getFileCache(file)?.frontmatter === undefined && !fileContent.match(/^-{3}\s*\n*\r*-{3}/));
-
-
-	// 	const splitContent = fileContent.split("\n");
-	// 	if (isYamlEmpty) {
-	// 		splitContent.unshift("---");
-	// 		splitContent.unshift(`${propName}: ${propValue}`);
-	// 		splitContent.unshift("---");
-	// 	}
-	// 	else {
-	// 		splitContent.splice(1, 0, `${propName}: ${propValue}`);
-	// 	}
-
-	// 	const newFileContent = splitContent.join("\n");
-	// 	await this.app.vault.modify(file, newFileContent);
-	// }
-
-	onunload() {
-
-	}
+	onunload() {}
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -195,7 +303,7 @@ async createProjectFolder(project: Project, allProjects: Project[], baseFolder: 
 
 class TodoistSettingTab extends PluginSettingTab {
 	plugin: TodoistProjectSync;
- 
+
 	constructor(app: App, plugin: TodoistProjectSync) {
 		super(app, plugin);
 		this.plugin = plugin;
@@ -206,31 +314,83 @@ class TodoistSettingTab extends PluginSettingTab {
 
 		containerEl.empty();
 
-		containerEl.createEl('h2', { text: 'Settings.' });
+		containerEl.createEl('h2', { text: 'Todoist Project Sync Settings' });
 
 		new Setting(containerEl)
-			.setName('Todoist API Key')
-			.setDesc('It\'s a secret')
+			.setName('Todoist API key')
+			.setDesc('Your Todoist API token. Find it at Todoist Settings → Integrations → Developer.')
 			.addText(text => text
-				.setPlaceholder('Enter your secret')
+				.setPlaceholder('Enter your API token')
 				.setValue(this.plugin.settings.TodoistToken)
 				.onChange(async (value) => {
 					this.plugin.settings.TodoistToken = value;
 					await this.plugin.saveSettings();
+				}))
+			.addButton(button => button
+				.setButtonText('Test API key')
+				.onClick(async () => {
+					button.setButtonText('Testing…').setDisabled(true);
+					try {
+						await this.plugin.fetchTodoistProjects(this.plugin.settings.TodoistToken);
+						new Notice('✓ API key is valid.');
+					} catch {
+						new Notice('✗ Invalid API key or network error.');
+					} finally {
+						button.setButtonText('Test API key').setDisabled(false);
+					}
 				}));
+
 		new Setting(containerEl)
-			.setName('Todoist project Folder')
-			.setDesc('folder for projects')
+			.setName('Project folder')
+			.setDesc('Vault folder where project notes and sub-folders are created. Created automatically if it does not exist. Default: "Projects".')
 			.addText(text => text
-				.setPlaceholder('enter path')
+				.setPlaceholder('Projects')
 				.setValue(this.plugin.settings.TodoistProjectFolder)
 				.onChange(async (value) => {
 					this.plugin.settings.TodoistProjectFolder = value;
 					await this.plugin.saveSettings();
 				}));
+
+		new Setting(containerEl)
+			.setName('Archive folder')
+			.setDesc('Vault path where notes for deleted Todoist projects are moved. If a project is restored in Todoist, its note is automatically moved back. Update this if you change the project folder. Default: "Projects/archive".')
+			.addText(text => text
+				.setPlaceholder('Projects/archive')
+				.setValue(this.plugin.settings.ArchiveFolder)
+				.onChange(async (value) => {
+					this.plugin.settings.ArchiveFolder = value.trim();
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Note template')
+			.setDesc(
+				'Template used when creating a new project note. ' +
+				'Changes only affect newly created notes, not existing ones. ' +
+				'Available variables: ' +
+				'{{TodoistId}} (project ID), ' +
+				'{{ProjectName}} (project display name), ' +
+				'{{TodoistUrl}} (link to open project in Todoist).'
+			)
+			.addTextArea(text => {
+				text
+					.setPlaceholder('Enter template...')
+					.setValue(this.plugin.settings.NoteTemplate)
+					.onChange(async (value) => {
+						this.plugin.settings.NoteTemplate = value;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.rows = 12;
+				text.inputEl.cols = 50;
+				return text;
+			});
+
 		new Setting(containerEl)
 			.setName('Primary sync device')
-			.setDesc('if this field is set, projects will only sync on the device with this name. This is to prevent sync-problems if projects are updated on multiple devices. The name of this device is"' + os.hostname() + '".')
+			.setDesc(
+				'If set, syncing only runs on the device with this hostname — prevents conflicts when Obsidian is open on multiple devices. ' +
+				'The hostname of this device is "' + os.hostname() + '".'
+			)
 			.addText(text => text
 				.setPlaceholder('')
 				.setValue(this.plugin.settings.PrimarySyncDevice)
@@ -238,20 +398,20 @@ class TodoistSettingTab extends PluginSettingTab {
 					this.plugin.settings.PrimarySyncDevice = value;
 					await this.plugin.saveSettings();
 				}));
+
 		new Setting(containerEl)
-			.setName('Todoist sync frequency in seconds')
-			.setDesc('Sync frequency in seconds')
-			.addText(Number => Number
-				.setPlaceholder("0")
+			.setName('Sync frequency (seconds)')
+			.setDesc('How often to pull project changes from Todoist. Set to 0 to disable automatic sync. Default: 60.')
+			.addText(text => text
+				.setPlaceholder('60')
 				.setValue(this.plugin.settings.TodoistSyncFrequency.toString())
 				.onChange(async (value) => {
-					this.plugin.settings.TodoistSyncFrequency = parseInt(value);
-
-					await this.plugin.saveSettings();
-					this.plugin.setRefreshInterval();
-
+					const parsed = parseInt(value, 10);
+					if (!isNaN(parsed) && parsed >= 0) {
+						this.plugin.settings.TodoistSyncFrequency = parsed;
+						await this.plugin.saveSettings();
+						this.plugin.setRefreshInterval();
+					}
 				}));
-
 	}
 }
-

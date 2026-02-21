@@ -1,6 +1,7 @@
 import esbuild from "esbuild";
 import process from "process";
 import builtins from "builtin-modules";
+import { copyFileSync, existsSync } from "fs";
 
 const banner =
 `/*
@@ -40,8 +41,14 @@ const context = await esbuild.context({
 	outfile: "main.js",
 });
 
+const distPath = "Dist/0.1/ObsidianTodoistProjects/main.js";
+
 if (prod) {
 	await context.rebuild();
+	if (existsSync(distPath)) {
+		copyFileSync("main.js", distPath);
+		console.log(`Copied main.js → ${distPath}`);
+	}
 	process.exit(0);
 } else {
 	await context.watch();
